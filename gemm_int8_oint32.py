@@ -4,16 +4,16 @@
 import torch
 import argparse
 import os
-from torch.utils import benchmark
+import qortex.qgemm as qgemm
 import time
 # batch_size_choices = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512,1024,2048,4096,8192,16384]
-batch_size_choices = [128, 256, 512,1024,2048,4096,8192,16384]
+batch_size_choices = [ 128, 256, 512,1024,2048,4096,8192,16384]
 def get_args_parser():
     parser = argparse.ArgumentParser(description="PyTorch Distributed DataParallel")
     parser.add_argument("--shape_row", type=int, default=4096, help='shape_col')
     parser.add_argument('--output', type=str, default='output_gemm.txt', help='output')
     parser.add_argument("--gpu_type", type=str, default='RTX4090', help='gpu_type')
-    parser.add_argument("--data_type", type=str, default='FP32', help='data_type')
+    parser.add_argument("--data_type", type=str, default='INT8', help='data_type')
     parser.add_argument("--shape_col", type=int, default=4096, help='shape_col')
     parser.add_argument("--device", type=str, default='cuda', help='device')
     parser.add_argument("--plot_mode", type=bool, default=False, help='plot_mode')
@@ -36,58 +36,54 @@ def get_gpu_FLOPS(gpu_type, data_type):
 
 # @torch.compile()
 def geeem_sim(batch_size, data_type, device, data_shape_row, data_shape_col):
-
-    data_shape_col = int(data_shape_col)
-    data_shape_row = int(data_shape_row)
-    
-    # 对于FP32,打开TF32
-    if data_type == 'FP32':
-        torch.backends.cuda.matmul.allow_tf32 = True
-        torch.backends.cudnn.allow_tf32 = True
+    M = batch_size
+    N = int(data_shape_row)
+    K = int(data_shape_col)
     # 生成随机矩阵
-    if data_type == 'INT8':
-        a = torch.randint(-128, 127, (batch_size, data_shape_row)).to(device).to(torch.int8)
-        b = torch.randint(-128, 127, (data_shape_row, data_shape_col)).to(device).to(torch.int8)
-    else:
-        typ = DATA_TYPE2TORCH[data_type]
-        a = torch.randn(batch_size, data_shape_row).type(typ).to(device)
-        b = torch.randn(data_shape_row, data_shape_col).type(typ).to(device)
+    input = torch.randint(-80, 80, (M, K), dtype=torch.int8).to(device)
+    weight = torch.randint(-80, 80, (N, K), dtype=torch.int8).to(device)
+    
+    
+    # simulation
+    num_iter = 1000
+    num_warmup_iter = 20
+    # warm up
+    for _ in range(num_warmup_iter):
+        qgemm.w8a8_int8_o32(input, weight)
 
-    # 使用benchmark.Timer计算矩阵乘法的时间
-    if data_type == 'INT8':
-        t = benchmark.Timer(
-            stmt='torch._int_mm(a, b)',
-            globals={'a': a, 'b': b})
-    else:
-        t = benchmark.Timer(
-            stmt='torch.mm(a, b)',
-            globals={'a': a, 'b': b})
-    x_warm_up = t.timeit(100)
-    x = t.timeit(1000)
+    torch.cuda.synchronize()
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+    start.record()
+    for i in range(num_iter):
+        qgemm.w8a8_int8_o32(input, weight)
+    end.record()
+    torch.cuda.synchronize()
+    avg_time = start.elapsed_time(end) / num_iter
+    
     
     # 计算MFU和吞吐率
-    avg_time = x.median
-    gemm_FLOPs = 2 * batch_size * data_shape_row * data_shape_col
-    gemm_FLOPs_t = gemm_FLOPs / 1e12
+    TFLOPS = 2 * M * N * K / avg_time / 1e9
     GPU_FLOPS = get_gpu_FLOPS('RTX4090', data_type)
-    MFU = (gemm_FLOPs_t / GPU_FLOPS ) / avg_time
-    FLOPS_shape = MFU * GPU_FLOPS
+    MFU = (TFLOPS / GPU_FLOPS ) 
     # 获取当前的时间，以 xxx年xx月xx日xx时xx分xx秒 的格式表示
     time_now = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(time.time()))
     print("time: ", time_now)
     print("batch_size: ", batch_size)
     print("MFU: ", MFU)
-    print("FLOPS_shape: ", FLOPS_shape)
+    print("FLOPS_shape: ", TFLOPS)
     print("data_shape: ", str(data_shape_row)+'x'+str(data_shape_col))
     
-    return  MFU, FLOPS_shape, avg_time
+    return  MFU, TFLOPS, avg_time
 
 def main():
     args = get_args_parser()
+    assert args.device == 'cuda', "only support cuda"
     device = torch.device(args.device)
-    if not os.path.exists('output'):
-        os.makedirs('output')
-    with open('./output/' + args.output, 'w') as f:
+    assert args.data_type == 'INT8', "only support INT8"
+    if not os.path.exists('output_oint32'):
+        os.makedirs('output_oint32')
+    with open('./output_oint32/' + args.output, 'w') as f:
         f.write("\n")
         f.write("shape: " + str(args.shape_row)+'x'+str(args.shape_col) + "\n")
         f.write("\n")
@@ -102,14 +98,10 @@ def main():
         print("batch_size: " + str(batch_size))
         # 计算MFU和吞吐率
         MFU, FLOPS_of_shape, avg_time = geeem_sim(batch_size, args.data_type, device, args.shape_row, args.shape_col)
-        with open('./output/' + args.output, 'a') as f:
+        with open('./output_oint32/' + args.output, 'a') as f:
             if args.plot_mode:
                 if args.data_type == 'INT8':
                     f.write("batch_size: " + str(batch_size) + " MFU: " + str(MFU)  + " OPS: " + str(FLOPS_of_shape) + "\n")
-                    f.write("avg_time: " + str(avg_time*1000) + "ms\n")
-                    f.write("\n")
-                else:
-                    f.write("batch_size: " + str(batch_size) + " MFU: " + str(MFU)  + " FLOPS: " + str(FLOPS_of_shape) + "\n")
                     f.write("avg_time: " + str(avg_time*1000) + "ms\n")
                     f.write("\n")
             else:
@@ -117,10 +109,7 @@ def main():
                 f.write("*"*30 + "\n")
                 f.write("batch_size: " + str(batch_size) + "\n")
                 f.write("MFU: " + str(MFU) + "\n")
-                if args.data_type == 'INT8':
-                    f.write("OPS: " + str(FLOPS_of_shape) + "\n")
-                else:
-                    f.write("FLOPS: " + str(FLOPS_of_shape) + "\n")
+                f.write("OPS: " + str(FLOPS_of_shape) + "\n")
                 f.write("avg_time: " + str(avg_time) + "\n")
                 f.write("*"*30 + "\n")
                 f.write("\n")   
